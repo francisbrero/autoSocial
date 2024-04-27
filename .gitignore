@@ -28,6 +28,8 @@ MANIFEST
 
 data/*
 input/*
+clips/*
+posts/*
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
