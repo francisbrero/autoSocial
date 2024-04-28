@@ -6,6 +6,9 @@ from openai import OpenAI
 from youtube_transcript_api import YouTubeTranscriptApi
 import ffmpeg
 from dotenv import load_dotenv
+import chromadb
+from chromadb.utils.embedding_functions import OpenAIEmbeddingFunction
+
 
 # Load environment variables from .env file
 load_dotenv()
@@ -28,8 +31,13 @@ client = OpenAI(
     api_key=openai_api_key
     )
 
+insights = []
+
+# Handle the workload while we don't have insights selected
 if 'insights' not in st.session_state:
-    print(st.session_state)
+    st.header("Welcome to the Video Insights App")
+    st.write("This app helps you generate key insights, short video clips, and social media posts from a video.")
+    st.write("To get started, select a video from the dropdown below.")
     if 'selected_video' not in st.session_state:
         # Display the list of videos for the user to select
         selected_video = st.selectbox('Select a video', videos)
@@ -42,7 +50,7 @@ if 'insights' not in st.session_state:
         # Fetch the transcript of the video
         transcript = YouTubeTranscriptApi.get_transcript(selected_video['youtube_id'])
         
-        
+    
         # write the transcript to a file in the data folder
         with open(f'data/{selected_video["youtube_id"]}.json', 'w') as f:
             json.dump(transcript, f)
@@ -53,7 +61,8 @@ if 'insights' not in st.session_state:
             transcript_text += f"{line['text']} "
         
         # store the transcript, youtube_id in the session state
-        st.session_state.transcript = transcript_text
+        st.session_state.transcript_text = transcript_text
+        st.session_state.transcript = transcript
         st.session_state.youtube_id = selected_video['youtube_id']
         st.session_state.file = selected_video['file']
 
@@ -64,7 +73,7 @@ if 'insights' not in st.session_state:
     # Get the outline from the OpenAI API
     if 'outline' not in st.session_state:
         # Create the prompt to generate the outline based on the transcript
-        prompt_for_outline = prompts['outline'] + st.session_state.transcript
+        prompt_for_outline = prompts['outline'] + st.session_state.transcript_text
         print("Generating outline")
         response = client.chat.completions.create(
             model="gpt-3.5-turbo",
@@ -82,47 +91,119 @@ if 'insights' not in st.session_state:
         # show the outline as a markdown
         st.markdown(st.session_state.outline)
 
+    
     # Allow the user to share 3 key insights, the insights should each be inputted in a separate text box
     with st.form("insights_form"):
         st.markdown("Please share 3 key insights from the video that you would like to create clips and posts for.")
-        insight1 = st.text_input("Insight 1")
-        insight2 = st.text_input("Insight 2")
-        insight3 = st.text_input("Insight 3")
+        insight1 = st.text_input("Insight 1", key='insight1')
+        insight2 = st.text_input("Insight 2", key='insight2')
+        insight3 = st.text_input("Insight 3", key='insight3')
 
         insights = [insight1, insight2, insight3]
-        print(insights)
-        st.session_state.insights = insights
         # When the user presses the 'Submit' button, the form is processed and the app is rerun
-        st.form_submit_button("Submit Insights")
-                
+        form_submit_button = st.form_submit_button("Submit Insights")
+    
+    if form_submit_button:
+        st.session_state.insights = insights
+        print(st.session_state.insights)
+        st.write("Insights submitted successfully!")
+        st.write("You can now proceed to generate clips and posts.")
+        st.write("Click the button below to continue.")
+        st.button("Generate Clips and Posts")
+
+
+# Now that we have the insights, let's generate clips                
 else:
-#  'insights' in st.session_state:
+    st.header("Creating Clips and Posts")
+
+    
+    # stop if the insights are empty
+    if len(st.session_state.insights) == 0:
+        st.write("You need to provide insights to continue")
+        st.stop()
+
+    # Get the variables
     youtube_id = st.session_state.youtube_id
     file = st.session_state.file
     insights = st.session_state.insights
+    transcript  = st.session_state.transcript
+    transcript_text  = st.session_state.transcript_text
+    
+    # Store the transcript in a chromadb vector store specific to the video
+    db_name = (f'transcript_{youtube_id}')
+    # Initialize the ChromaDB vector store
+    chroma_client = chromadb.Client()
+    # change the chromadb embedding model
+    EMBEDDING_MODEL = "text-embedding-3-large"
+    embedding_function = OpenAIEmbeddingFunction(api_key=openai_api_key, model_name=EMBEDDING_MODEL)
+
+    if "db_name" not in st.session_state:
+        collection = chroma_client.get_or_create_collection(db_name, embedding_function=embedding_function)
+    
+        # Save each transcript line in the vector store
+        st.write("Storing the transcript in the vector store")
+        i = 0
+        # add a progress bar
+        progress_bar = st.progress(0)
+        for document in transcript:
+            # print(document)
+            # Assuming your documents have a "text" field containing the content
+            collection.add(documents=[document["text"]],
+                        metadatas=[{"start": str(document["start"]), "duration": str(document["duration"])}], 
+                        ids=[str(i)])
+            i += 1
+            # Update the progress bar
+            progress_bar.progress((i+1)/(len(transcript)+1))
+        st.session_state.db_name = db_name
+        st.session_state.collection = collection
+
     # Extract the most relevant short section of the transcript for each key insight
-    def extract_sections(transcript, insights):
+    def extract_sections(collection, insights):
         sections = []
         for insight in insights:
-            # This is a placeholder. You'll need to implement this part based on your specific requirements.
+            # For each insight, find the most relevant section of the transcript. We will do this using semantic search with a vector store
+            # find the records in the collection that are the most similar to the insight
+            results = collection.query(
+                query_texts=[insight],
+                n_results=1
+            )
+            # Get the most relevant section of the transcript
+            if len(results) > 0:                
+                most_relevant = results['documents'][0]
+                # Get the index of the most relevant line in the transcript
+                index = results['ids'][0]
+                # Get the start and end timestamps of the section
+                metadata = results['metadatas'][0][0]
+                start_time = metadata['start']
+                end_time = float(metadata['start']) + float(metadata['duration'])
+            
             sections.append({
                 'insight': insight,
-                'timestamps': (0, 10)
+                'timestamps': (start_time, end_time)
             })
         return sections
 
     # Extract the sections from the transcript
-    sections = extract_sections(st.session_state.transcript, st.session_state.insights)
+    if 'collection' not in st.session_state:
+        st.write("Something went wrong")
+    
+    print(st.session_state.insights)
+    sections = extract_sections(st.session_state.collection, st.session_state.insights)
+    # sections = extract_sections(st.session_state.collection, ["PLG is different from ABM, it's a bottom up approach","RevOps should be centralized"])
 
     # Create short video clips for each of the sections, show a progress bar
     st.write("Creating video clips for each key insight")
     progress_bar = st.progress(0)
     for i, section in enumerate(sections):
+        st.write(f"Creating clip for insight: {section['insight']}")
         start_time, end_time = section['timestamps']
         # write the files in a folder named after the video id in the clips folder
         os.makedirs(f'clips/{youtube_id}', exist_ok=True)
         output_file = f'clips/{youtube_id}/clip_{i}.mp4'
         # if the file already exists, delete it
+        print(file)
+        print(start_time)
+        print(end_time)
         if os.path.exists(output_file):
             os.remove(output_file)
         (
@@ -133,13 +214,16 @@ else:
         )
         # Update the progress bar
         progress_bar.progress((i+1)/len(sections))
+        # display the video in an expandable section
+        with st.expander(f"Here's the clip for insight: {section['insight']}"):
+            st.video(output_file)
 
-    def generate_post(prompt, section, insight):
+    def generate_post(section, insight):
         response = client.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[
                 {"role": "system", "content": "You are a social media manager. Your job is to write a post based on an insight and its supporting short video clip."},
-                {"role": "user", "content": prompt.format(insight=insight, section=section)}
+                {"role": "user", "content": insight}
             ],
             max_tokens=500
         )
@@ -149,18 +233,23 @@ else:
     st.write("Creating social media posts for each key insight")
     progress_bar2 = st.progress(0)
     for i, section in enumerate(sections):
-        post = generate_post(prompts['post'], section, insights[i])
+        st.write(f"Creating post for insight: {section['insight']}")
+        post = generate_post(section, insights[i])
         # create a new folder for the posts for this video using the id of the video
         os.makedirs(f'posts/{youtube_id}', exist_ok=True)
         with open(f'posts/{youtube_id}/post_{i}.txt', 'w') as f:
             f.write(post)
         # Update the progress bar
         progress_bar2.progress((i+1)/len(sections))
+        # display the post in an expandable section
+        with st.expander(f"Here's the post for insight: {section['insight']}"):
+            st.write(post)
 
     # You are done! Display a message to the user
     st.write("You're all set! You can find the clips and posts in the clips and posts folders respectively.")
 
     # Add a button to restart from the beginning
     if st.button("Start Over"):
-        st.session_state.submitted = False
-        st.experimental_rerun()
+        # clear all session state variables
+        st.session_state.clear()
+        st.rerun()
