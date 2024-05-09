@@ -1,3 +1,4 @@
+import webbrowser
 import streamlit as st
 import json
 import time
@@ -8,6 +9,7 @@ import ffmpeg
 from dotenv import load_dotenv
 import chromadb
 from chromadb.utils.embedding_functions import OpenAIEmbeddingFunction
+import requests
 
 
 # Load environment variables from .env file
@@ -31,7 +33,49 @@ client = OpenAI(
     api_key=openai_api_key
     )
 
+# Get your Descript API key from the environment variables
+descript_api_key = os.getenv('DESCRIPT_API_KEY')
+if descript_api_key is None:
+    raise ValueError("DESCRIPT_API_KEY environment variable not set")
+
 insights = []
+
+
+
+def create_import_url(descript_api_key, file_path):
+  # Replace with your Descript API key
+  descript_api_key = descript_api_key
+  url = "https://api.descript.com/v2/cloud-imports"
+
+  headers = {
+      "Authorization": f"Bearer {descript_api_key}"
+  }
+
+  data = {
+      "source": "LOCAL",  # Local file upload
+      "local_file": file_path
+  }
+
+  response = requests.post(url, headers=headers, json=data)
+
+  if response.status_code == 200:
+    data = response.json()
+    return data.get("import_url")
+  else:
+    print(f"Error creating import URL: {response.text}")
+    return None
+
+def import_to_descript(descript_api_key, folder_path):
+  for filename in os.listdir(folder_path):
+    filepath = os.path.join(folder_path, filename)
+    import_url = create_import_url(descript_api_key, filepath)
+    if import_url:
+        print(f"Import URL for {filename}: {import_url}")
+        # Open the import URL in a web browser (optional)
+        webbrowser.open(import_url)
+
+
+
 
 # Handle the workload while we don't have insights selected
 if 'insights' not in st.session_state:
@@ -137,7 +181,8 @@ else:
     EMBEDDING_MODEL = "text-embedding-3-large"
     embedding_function = OpenAIEmbeddingFunction(api_key=openai_api_key, model_name=EMBEDDING_MODEL)
 
-    if "db_name" not in st.session_state:
+    # If we've already
+    if db_name not in st.session_state:
         collection = chroma_client.get_or_create_collection(db_name, embedding_function=embedding_function)
     
         # Save each transcript line in the vector store
@@ -159,6 +204,7 @@ else:
 
     # Extract the most relevant short section of the transcript for each key insight
     def extract_sections(collection, insights):
+        #TODO: instead of just searching the short 4s sections, we'd want to concatenate some of them
         sections = []
         for insight in insights:
             # For each insight, find the most relevant section of the transcript. We will do this using semantic search with a vector store
@@ -174,8 +220,8 @@ else:
                 index = results['ids'][0]
                 # Get the start and end timestamps of the section
                 metadata = results['metadatas'][0][0]
-                start_time = metadata['start']
-                end_time = float(metadata['start']) + float(metadata['duration'])
+                start_time = max(float(metadata['start'])-15, 0)
+                end_time = float(metadata['start']) + float(metadata['duration']) + 20
             
             sections.append({
                 'insight': insight,
@@ -222,7 +268,7 @@ else:
         response = client.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[
-                {"role": "system", "content": "You are a social media manager. Your job is to write a post based on an insight and its supporting short video clip."},
+                {"role": "system", "content": prompts['outline']},
                 {"role": "user", "content": insight}
             ],
             max_tokens=500
@@ -247,6 +293,10 @@ else:
 
     # You are done! Display a message to the user
     st.write("You're all set! You can find the clips and posts in the clips and posts folders respectively.")
+
+    #TODO: Add a button to load the videos into Descript and create a project
+    # folder_path = f'clips/{youtube_id}'
+    # import_to_descript(descript_api_key, folder_path)
 
     # Add a button to restart from the beginning
     if st.button("Start Over"):

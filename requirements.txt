@@ -4,3 +4,4 @@ youtube_transcript_api
 ffmpeg-python
 streamlit
 python-dotenv
+requests
